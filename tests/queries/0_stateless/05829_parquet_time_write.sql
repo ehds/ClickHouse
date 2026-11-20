@@ -1,7 +1,7 @@
 -- Tags: no-fasttest
 
 -- Writing `Time`/`Time64` columns to Parquet must map to the Parquet `TIME` logical type
--- (INT32 MILLIS for `Time`, INT64 MILLIS/MICROS/NANOS for `Time64`), symmetric to the
+-- (INT32 MILLIS, INT64 MICROS/NANOS), symmetric to the
 -- reader side which infers `Time64` from Parquet `TIME`.
 
 SET engine_file_truncate_on_insert = 1;
@@ -13,7 +13,7 @@ DESCRIBE TABLE file(currentDatabase() || '_05829_time.parquet');
 SELECT toString(t) FROM file(currentDatabase() || '_05829_time.parquet');
 
 -- Time64 with different scales: 9 -> NANOS, 6 -> MICROS, 3 -> MILLIS,
--- 0 and 5 are rescaled to the next coarser parquet unit.
+-- 0 and 5 are rescaled to the next finer Parquet unit.
 INSERT INTO FUNCTION file(currentDatabase() || '_05829_time64.parquet', Parquet, 't9 Time64(9), t6 Time64(6), t3 Time64(3), t0 Time64(0), t5 Time64(5)')
     SELECT toTime64('01:02:03.456789012', 9), toTime64('01:02:03.456789', 6), toTime64('01:02:03.456', 3), toTime64('01:02:03', 0), toTime64('01:02:03.45678', 5);
 DESCRIBE TABLE file(currentDatabase() || '_05829_time64.parquet');

@@ -33,6 +33,7 @@
 #include <limits>
 #include <set>
 #include <DataTypes/DataTypeEnum.h>
+#include <DataTypes/DataTypeTime64.h>
 #include <Core/Block.h>
 #include <DataTypes/DataTypeCustom.h>
 #include <zstd.h>
@@ -640,9 +641,9 @@ struct ConverterDateTime
     }
 };
 
-/// Multiply Time by 1000 to get milliseconds (because Parquet doesn't support seconds).
-/// Unlike DateTime, the physical type stays INT32 (parquet only allows INT32 for
-/// `TIME` with `MILLIS` unit), so values beyond a day would overflow and are rejected.
+/// Multiply `Time` by 1000 to get milliseconds (Parquet does not support seconds).
+/// Parquet `TIME` represents a time of day, so reject durations outside [0, 86400)
+/// seconds before scaling. Every valid millisecond value fits in `INT32`.
 struct ConverterTime
 {
     using Statistics = StatisticsNumeric<Int32, Int32>;
@@ -658,41 +659,52 @@ struct ConverterTime
         buf.resize(count);
         for (size_t i = 0; i < count; ++i)
         {
-            Int64 value = static_cast<Int64>(column.getData()[offset + i]) * 1000;
-            if (value > std::numeric_limits<Int32>::max() || value < std::numeric_limits<Int32>::min())
+            Int64 value = column.getData()[offset + i];
+            if (value < 0 || value >= 86400)
                 throw Exception(
                     ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE,
-                    "Time value {} is out of range for Parquet TIME (milliseconds, INT32)",
-                    column.getData()[offset + i]);
-            buf[i] = static_cast<Int32>(value);
+                    "Time value {} is out of range for Parquet TIME: expected [0, 86400) seconds",
+                    value);
+            buf[i] = static_cast<Int32>(value * 1000);
         }
         return buf.data();
     }
 };
 
-/// Like ConverterDateTime64WithMultiplier but for Time64 (both are Decimal64-backed).
-struct ConverterTime64WithMultiplier
+/// Convert `Time64` ticks to the selected Parquet unit and check the time-of-day
+/// range even when no rescaling is needed. Statistics use the converted values.
+template <typename To>
+struct ConverterTime64
 {
-    using Statistics = StatisticsNumeric<Int64, Int64>;
+    using Statistics = StatisticsNumeric<To, To>;
 
     using Col = ColumnDecimal<Time64>;
     const Col & column;
     Int64 multiplier;
-    PODArray<Int64> buf;
+    Int64 ticks_per_day;
+    PODArray<To> buf;
 
-    ConverterTime64WithMultiplier(const ColumnPtr & c, Int64 multiplier_) : column(assert_cast<const Col &>(*c)), multiplier(multiplier_) {}
+    ConverterTime64(const ColumnPtr & c, Int64 multiplier_)
+        : column(assert_cast<const Col &>(*c))
+        , multiplier(multiplier_)
+        , ticks_per_day(86400 * DataTypeTime64::getScaleMultiplier(column.getScale()).value)
+    {
+    }
 
-    const Int64 * getBatch(size_t offset, size_t count)
+    const To * getBatch(size_t offset, size_t count)
     {
         buf.resize(count);
         for (size_t i = 0; i < count; ++i)
         {
             Int64 value = column.getData()[offset + i].value;
-            if (common::mulOverflow(value, multiplier, buf[i]))
+            if (value < 0 || value >= ticks_per_day)
                 throw Exception(
                     ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE,
-                    "Time64 value {} is out of range for Parquet TIME (multiplier {})",
-                    value, multiplier);
+                    "Time64 value {} is out of range for Parquet TIME: expected [0, {}) ticks",
+                    value, ticks_per_day);
+            /// The validated time of day fits in `INT32` milliseconds or `INT64`
+            /// microseconds/nanoseconds, including the intermediate multiplication.
+            buf[i] = static_cast<To>(value * multiplier);
         }
         return buf.data();
     }
@@ -2527,14 +2539,12 @@ void writeColumnChunkBody(
             break;
 
         case TypeIndex::Time64:
-            if (s.datetime_multiplier == 1)
-                writeColumnImpl<Int64Type>(
-                    s, options, out, ConverterNumeric<ColumnDecimal<Time64>, Int64, Int64>(
-                        s.primitive_column));
+            if (s.column_chunk.meta_data.type == parq::Type::INT32)
+                writeColumnImpl<Int32Type>(
+                    s, options, out, ConverterTime64<Int32>(s.primitive_column, s.datetime_multiplier));
             else
                 writeColumnImpl<Int64Type>(
-                    s, options, out, ConverterTime64WithMultiplier(
-                        s.primitive_column, s.datetime_multiplier));
+                    s, options, out, ConverterTime64<Int64>(s.primitive_column, s.datetime_multiplier));
             break;
 
         case TypeIndex::IPv4:
