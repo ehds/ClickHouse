@@ -640,6 +640,64 @@ struct ConverterDateTime
     }
 };
 
+/// Multiply Time by 1000 to get milliseconds (because Parquet doesn't support seconds).
+/// Unlike DateTime, the physical type stays INT32 (parquet only allows INT32 for
+/// `TIME` with `MILLIS` unit), so values beyond a day would overflow and are rejected.
+struct ConverterTime
+{
+    using Statistics = StatisticsNumeric<Int32, Int32>;
+
+    using Col = ColumnVector<Int32>;
+    const Col & column;
+    PODArray<Int32> buf;
+
+    explicit ConverterTime(const ColumnPtr & c) : column(assert_cast<const Col &>(*c)) {}
+
+    const Int32 * getBatch(size_t offset, size_t count)
+    {
+        buf.resize(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            Int64 value = static_cast<Int64>(column.getData()[offset + i]) * 1000;
+            if (value > std::numeric_limits<Int32>::max() || value < std::numeric_limits<Int32>::min())
+                throw Exception(
+                    ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE,
+                    "Time value {} is out of range for Parquet TIME (milliseconds, INT32)",
+                    column.getData()[offset + i]);
+            buf[i] = static_cast<Int32>(value);
+        }
+        return buf.data();
+    }
+};
+
+/// Like ConverterDateTime64WithMultiplier but for Time64 (both are Decimal64-backed).
+struct ConverterTime64WithMultiplier
+{
+    using Statistics = StatisticsNumeric<Int64, Int64>;
+
+    using Col = ColumnDecimal<Time64>;
+    const Col & column;
+    Int64 multiplier;
+    PODArray<Int64> buf;
+
+    ConverterTime64WithMultiplier(const ColumnPtr & c, Int64 multiplier_) : column(assert_cast<const Col &>(*c)), multiplier(multiplier_) {}
+
+    const Int64 * getBatch(size_t offset, size_t count)
+    {
+        buf.resize(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            Int64 value = column.getData()[offset + i].value;
+            if (common::mulOverflow(value, multiplier, buf[i]))
+                throw Exception(
+                    ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE,
+                    "Time64 value {} is out of range for Parquet TIME (multiplier {})",
+                    value, multiplier);
+        }
+        return buf.data();
+    }
+};
+
 struct ConverterString
 {
     using Statistics = StatisticsStringRef;
@@ -2418,7 +2476,18 @@ void writeColumnChunkBody(
                 N(Int16, Int32Type);
             break;
         }
-        case TypeIndex::Int32  : N(Int32,  Int32Type); break;
+        case TypeIndex::Int32:
+            if (s.datetime_multiplier == 1)
+            {
+                N(Int32, Int32Type);
+            }
+            else
+            {
+                /// It's actually a Time that needs to be converted to milliseconds.
+                chassert(s.datetime_multiplier == 1000);
+                writeColumnImpl<Int32Type>(s, options, out, ConverterTime(s.primitive_column));
+            }
+            break;
         case TypeIndex::Int64  : N(Int64,  Int64Type); break;
 
         case TypeIndex::UInt32:
@@ -2454,6 +2523,17 @@ void writeColumnChunkBody(
             else
                 writeColumnImpl<Int64Type>(
                     s, options, out, ConverterDateTime64WithMultiplier(
+                        s.primitive_column, s.datetime_multiplier));
+            break;
+
+        case TypeIndex::Time64:
+            if (s.datetime_multiplier == 1)
+                writeColumnImpl<Int64Type>(
+                    s, options, out, ConverterNumeric<ColumnDecimal<Time64>, Int64, Int64>(
+                        s.primitive_column));
+            else
+                writeColumnImpl<Int64Type>(
+                    s, options, out, ConverterTime64WithMultiplier(
                         s.primitive_column, s.datetime_multiplier));
             break;
 
